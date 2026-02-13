@@ -7,9 +7,8 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server);
 
-const path = require("path");
-app.use(express.static(path.join(__dirname, "public")));
-
+const PORT = 3000;
+const ANNOUNCED_IP = "15.206.94.127"; // <-- CHANGE if needed
 
 let worker;
 let router;
@@ -23,36 +22,37 @@ let consumers = [];
   router = await worker.createRouter({
     mediaCodecs: [
       {
+        kind: "audio",
+        mimeType: "audio/opus",
+        clockRate: 48000,
+        channels: 2
+      },
+      {
         kind: "video",
         mimeType: "video/VP8",
         clockRate: 90000
       }
     ]
   });
-  console.log("Mediasoup worker & router ready");
+  console.log("Mediasoup ready");
 })();
 
 io.on("connection", socket => {
   console.log("User connected:", socket.id);
 
-  // 1️⃣ Send RTP Capabilities
-  socket.on("getRtpCapabilities", (callback) => {
+  socket.on("getRtpCapabilities", callback => {
     callback(router.rtpCapabilities);
   });
 
-  // 2️⃣ Create WebRTC Transport
-  socket.on("createTransport", async (callback) => {
+  socket.on("createTransport", async callback => {
     const transport = await router.createWebRtcTransport({
-      listenIps: [{ ip: "0.0.0.0", announcedIp: null }],
+      listenIps: [{ ip: "0.0.0.0", announcedIp: ANNOUNCED_IP }],
       enableUdp: true,
       enableTcp: true,
       preferUdp: true
     });
 
-    transports.push({
-      socketId: socket.id,
-      transport
-    });
+    transports.push({ socketId: socket.id, transport });
 
     callback({
       id: transport.id,
@@ -62,13 +62,11 @@ io.on("connection", socket => {
     });
   });
 
-  // 3️⃣ Connect Transport (DTLS)
   socket.on("connectTransport", async ({ dtlsParameters }) => {
     const transportData = transports.find(t => t.socketId === socket.id);
     await transportData.transport.connect({ dtlsParameters });
   });
 
-  // 4️⃣ Produce (Send Video)
   socket.on("produce", async ({ kind, rtpParameters }, callback) => {
     const transportData = transports.find(t => t.socketId === socket.id);
 
@@ -77,63 +75,157 @@ io.on("connection", socket => {
       rtpParameters
     });
 
-    producers.push({
-      socketId: socket.id,
-      producer
-    });
+    producers.push({ socketId: socket.id, producer });
 
     callback({ id: producer.id });
-
-    // Notify others
     socket.broadcast.emit("newProducer");
   });
 
-  // 5️⃣ Consume (Receive Video)
   socket.on("consume", async ({ rtpCapabilities }, callback) => {
+    for (let p of producers) {
+      if (p.socketId === socket.id) continue;
 
-    const producerData = producers.find(p => p.socketId !== socket.id);
-    if (!producerData) return;
+      if (!router.canConsume({
+        producerId: p.producer.id,
+        rtpCapabilities
+      })) continue;
 
-    if (!router.canConsume({
-      producerId: producerData.producer.id,
-      rtpCapabilities
-    })) {
-      console.log("Cannot consume");
+      const transportData = transports.find(t => t.socketId === socket.id);
+
+      const consumer = await transportData.transport.consume({
+        producerId: p.producer.id,
+        rtpCapabilities,
+        paused: false
+      });
+
+      consumers.push({ socketId: socket.id, consumer });
+
+      callback({
+        id: consumer.id,
+        producerId: p.producer.id,
+        kind: consumer.kind,
+        rtpParameters: consumer.rtpParameters
+      });
+
       return;
     }
-
-    const transportData = transports.find(t => t.socketId === socket.id);
-
-    const consumer = await transportData.transport.consume({
-      producerId: producerData.producer.id,
-      rtpCapabilities,
-      paused: false
-    });
-
-    consumers.push({
-      socketId: socket.id,
-      consumer
-    });
-
-    callback({
-      id: consumer.id,
-      producerId: producerData.producer.id,
-      kind: consumer.kind,
-      rtpParameters: consumer.rtpParameters
-    });
   });
 
-  // 6️⃣ Cleanup on Disconnect
   socket.on("disconnect", () => {
-    console.log("User disconnected:", socket.id);
-
     transports = transports.filter(t => t.socketId !== socket.id);
     producers = producers.filter(p => p.socketId !== socket.id);
     consumers = consumers.filter(c => c.socketId !== socket.id);
   });
-
 });
 
-server.listen(3000, () => {
-  console.log("Server running on http://localhost:3000");
+/* Serve frontend directly */
+app.get("/", (req, res) => {
+  res.send(`
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Mediasoup SFU</title>
+  <style>
+    video { width: 300px; margin: 10px; background: black; }
+  </style>
+</head>
+<body>
+  <h2>Mediasoup Video + Audio</h2>
+  <video id="localVideo" autoplay muted></video>
+  <video id="remoteVideo" autoplay></video>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="https://unpkg.com/mediasoup-client@3/lib/index.js"></script>
+  <script>
+    const socket = io();
+    let device;
+    let producerTransport;
+    let consumerTransport;
+
+    const localVideo = document.getElementById("localVideo");
+    const remoteVideo = document.getElementById("remoteVideo");
+
+    async function init() {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: true,
+        audio: true
+      });
+
+      localVideo.srcObject = stream;
+
+      const rtpCapabilities = await new Promise(resolve =>
+        socket.emit("getRtpCapabilities", resolve)
+      );
+
+      device = new mediasoupClient.Device();
+      await device.load({ routerRtpCapabilities: rtpCapabilities });
+
+      const sendParams = await new Promise(resolve =>
+        socket.emit("createTransport", resolve)
+      );
+
+      producerTransport = device.createSendTransport(sendParams);
+
+      producerTransport.on("connect", ({ dtlsParameters }, callback) => {
+        socket.emit("connectTransport", { dtlsParameters });
+        callback();
+      });
+
+      producerTransport.on("produce", ({ kind, rtpParameters }, callback) => {
+        socket.emit("produce", { kind, rtpParameters }, ({ id }) => {
+          callback({ id });
+        });
+      });
+
+      for (let track of stream.getTracks()) {
+        await producerTransport.produce({ track });
+      }
+
+      socket.on("newProducer", consume);
+    }
+
+    async function consume() {
+      const recvParams = await new Promise(resolve =>
+        socket.emit("createTransport", resolve)
+      );
+
+      consumerTransport = device.createRecvTransport(recvParams);
+
+      consumerTransport.on("connect", ({ dtlsParameters }, callback) => {
+        socket.emit("connectTransport", { dtlsParameters });
+        callback();
+      });
+
+      const data = await new Promise(resolve =>
+        socket.emit("consume", {
+          rtpCapabilities: device.rtpCapabilities
+        }, resolve)
+      );
+
+      if (!data) return;
+
+      const consumer = await consumerTransport.consume(data);
+
+      const remoteStream = new MediaStream();
+      remoteStream.addTrack(consumer.track);
+
+      if (consumer.kind === "video") {
+        remoteVideo.srcObject = remoteStream;
+      } else {
+        const audio = document.createElement("audio");
+        audio.srcObject = remoteStream;
+        audio.autoplay = true;
+        document.body.appendChild(audio);
+      }
+    }
+
+    init();
+  </script>
+</body>
+</html>
+  `);
+});
+
+server.listen(PORT, () => {
+  console.log("Server running on port " + PORT);
 });

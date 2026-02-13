@@ -1,25 +1,137 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <title>Mediasoup Video Room</title>
+  <title>Mediasoup SFU</title>
+
   <style>
+    body {
+      background: #121212;
+      color: white;
+      text-align: center;
+      font-family: Arial, sans-serif;
+      margin: 0;
+      padding: 20px;
+    }
+
+    h2 {
+      margin-bottom: 20px;
+    }
+
+    .video-container {
+      display: flex;
+      justify-content: center;
+      gap: 20px;
+      flex-wrap: wrap;
+    }
+
     video {
-      width: 300px;
-      margin: 10px;
+      width: 320px;
       background: black;
+      border-radius: 12px;
+      box-shadow: 0 0 20px rgba(0,0,0,0.6);
     }
   </style>
+
 </head>
 <body>
 
-  <h2>Mediasoup SFU Demo</h2>
+  <h2>Mediasoup Video + Audio</h2>
 
-  <video id="localVideo" autoplay muted></video>
-  <video id="remoteVideo" autoplay></video>
+  <div class="video-container">
+    <video id="localVideo" autoplay muted></video>
+    <video id="remoteVideo" autoplay></video>
+  </div>
 
   <script src="/socket.io/socket.io.js"></script>
   <script src="https://unpkg.com/mediasoup-client@3/lib/index.js"></script>
-  <script src="client.js"></script>
+
+  <script>
+    const socket = io();
+
+    let device;
+    let producerTransport;
+    let consumerTransport;
+
+    const localVideo = document.getElementById("localVideo");
+    const remoteVideo = document.getElementById("remoteVideo");
+
+    async function init() {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: true,
+        audio: true
+      });
+
+      localVideo.srcObject = stream;
+
+      const rtpCapabilities = await new Promise(resolve =>
+        socket.emit("getRtpCapabilities", resolve)
+      );
+
+      device = new mediasoupClient.Device();
+      await device.load({ routerRtpCapabilities: rtpCapabilities });
+
+      const sendParams = await new Promise(resolve =>
+        socket.emit("createTransport", resolve)
+      );
+
+      producerTransport = device.createSendTransport(sendParams);
+
+      producerTransport.on("connect", ({ dtlsParameters }, callback) => {
+        socket.emit("connectTransport", { dtlsParameters });
+        callback();
+      });
+
+      producerTransport.on("produce", ({ kind, rtpParameters }, callback) => {
+        socket.emit("produce", { kind, rtpParameters }, ({ id }) => {
+          callback({ id });
+        });
+      });
+
+      for (let track of stream.getTracks()) {
+        await producerTransport.produce({ track });
+      }
+
+      socket.on("newProducer", consume);
+    }
+
+    async function consume() {
+      const recvParams = await new Promise(resolve =>
+        socket.emit("createTransport", resolve)
+      );
+
+      consumerTransport = device.createRecvTransport(recvParams);
+
+      consumerTransport.on("connect", ({ dtlsParameters }, callback) => {
+        socket.emit("connectTransport", { dtlsParameters });
+        callback();
+      });
+
+      const data = await new Promise(resolve =>
+        socket.emit("consume", {
+          rtpCapabilities: device.rtpCapabilities
+        }, resolve)
+      );
+
+      if (!data) return;
+
+      const consumer = await consumerTransport.consume(data);
+
+      const remoteStream = new MediaStream();
+      remoteStream.addTrack(consumer.track);
+
+      if (consumer.kind === "video") {
+        remoteVideo.srcObject = remoteStream;
+      } else {
+        const audio = document.createElement("audio");
+        audio.srcObject = remoteStream;
+        audio.autoplay = true;
+        document.body.appendChild(audio);
+      }
+    }
+
+    init();
+  </script>
 
 </body>
 </html>
+
